@@ -12,6 +12,7 @@ start_server:
 		--ckpt-dir lingbot-world-v2-14b-causal-fast \
 		--action-path examples/03 \
 		--data-dir /mnt/workspace/lingbot-world-service \
+		--output-dir /mnt/outputs/lingbot-world-v2 \
 		--host 0.0.0.0 \
 		--port 8000 \
 		--max-queue-size 32 \
@@ -23,5 +24,5 @@ start_client:
 		--image examples/03/image.jpg \
 		--frame-num 361 \
 		--seed 42 \
-		--output output/result.mp4 \
+		--output-dir /mnt/outputs/lingbot-world-v2/downloads \
 		--prompt "A serene lakeside scene with a lone tree standing in calm water."

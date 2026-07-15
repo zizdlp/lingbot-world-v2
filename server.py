@@ -45,6 +45,11 @@ def parse_args():
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--data-dir", default="/mnt/workspace/lingbot-world-service")
+    parser.add_argument(
+        "--output-dir",
+        default="/mnt/outputs/lingbot-world-v2",
+        help="Directory for generated videos; keep this on persistent storage.",
+    )
     parser.add_argument("--max-queue-size", type=int, default=32)
     parser.add_argument("--retention-hours", type=int, default=168)
     parser.add_argument("--size", choices=SUPPORTED_SIZES, default="480*832")
@@ -87,6 +92,7 @@ class ServiceState:
         self.args = args
         self.world_size = world_size
         self.data_dir = Path(args.data_dir)
+        self.output_dir = Path(args.output_dir)
         self.jobs_dir = self.data_dir / "jobs"
         self.db_path = self.data_dir / "jobs.sqlite3"
         self.db_lock = threading.RLock()
@@ -254,7 +260,7 @@ class ServiceState:
             date_path = datetime.now(timezone.utc).strftime("%Y/%m/%d")
             job_dir = self.jobs_dir / date_path / job_id
             image_path = job_dir / f"input{image_suffix}"
-            output_path = job_dir / "result.mp4"
+            output_path = self.output_dir / date_path / f"{job_id}.mp4"
             request_path = job_dir / "request.json"
             job_dir.mkdir(parents=True, exist_ok=False)
             try:
@@ -407,7 +413,7 @@ class ServiceState:
         with self.db_lock:
             rows = self.db.execute(
                 """
-                SELECT id, job_dir FROM jobs
+                SELECT id, job_dir, output_path FROM jobs
                 WHERE status IN ('succeeded', 'failed')
                   AND finished_at IS NOT NULL
                   AND finished_at < ?
@@ -416,6 +422,7 @@ class ServiceState:
             ).fetchall()
             for row in rows:
                 shutil.rmtree(row["job_dir"], ignore_errors=True)
+                Path(row["output_path"]).unlink(missing_ok=True)
                 self.db.execute("DELETE FROM jobs WHERE id = ?", (row["id"],))
             self.db.commit()
             return len(rows)
@@ -442,6 +449,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "jobs": self.service.counts(),
                     "max_queue_size": self.service.args.max_queue_size,
                     "data_dir": str(self.service.data_dir),
+                    "output_dir": str(self.service.output_dir),
                 },
             )
             return
@@ -631,6 +639,7 @@ def validate_server_paths(args):
     data_dir = Path(args.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "jobs").mkdir(parents=True, exist_ok=True)
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
 
 def create_pipeline(args, rank, local_rank, world_size):
@@ -748,6 +757,7 @@ def rank_zero_loop(pipeline, config, args, world_size):
         http_thread.start()
         logging.info("Server ready at http://%s:%s", args.host, args.port)
         logging.info("Persistent job data: %s", state.data_dir)
+        logging.info("Generated video output: %s", state.output_dir)
 
         while True:
             try:

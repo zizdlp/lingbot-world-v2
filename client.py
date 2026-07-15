@@ -27,7 +27,17 @@ def parse_args():
         default=None,
         help="Stable idempotency key; generated automatically when omitted.",
     )
-    parser.add_argument("--output", default=None)
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument(
+        "--output",
+        default=None,
+        help="Exact client-local path for the downloaded video.",
+    )
+    output_group.add_argument(
+        "--output-dir",
+        default="output",
+        help="Client-local download directory; the job id is used as the filename.",
+    )
     parser.add_argument("--poll-interval", type=float, default=2.0)
     parser.add_argument(
         "--timeout",
@@ -106,7 +116,9 @@ def wait_for_job(args, job):
 def download_video(args, job):
     video_url = urljoin(f"{args.server.rstrip('/')}/", job["video_url"].lstrip("/"))
     output_path = (
-        Path(args.output) if args.output else Path("output") / f"{job['id']}.mp4"
+        Path(args.output)
+        if args.output
+        else Path(args.output_dir) / f"{job['id']}.mp4"
     )
     partial_path = output_path.with_name(f"{output_path.name}.part")
     output_path.parent.mkdir(parents=True, exist_ok=True)
