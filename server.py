@@ -7,6 +7,7 @@ import gc
 import io
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -29,20 +30,73 @@ from PIL import Image, UnidentifiedImageError
 
 
 SUPPORTED_SIZES = ("720*1280", "1280*720", "480*832", "832*480")
+SUPPORTED_TASKS = ("i2v-A14B",)
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+DEFAULT_PROMPT = "A serene lakeside scene with a lone tree standing in calm water."
+DEFAULT_TIMESTEPS_INDEX = (0, 250, 500, 750)
+ARRAY_INPUTS = (
+    ("poses.npy", "poses_base64", (4, 4), True),
+    ("intrinsics.npy", "intrinsics_base64", (4,), True),
+    ("action.npy", "action_base64", (4,), False),
+    ("wasd_action.npy", "wasd_action_base64", (4,), False),
+    ("ijkl_action.npy", "ijkl_action_base64", (4,), False),
+)
 
 
 class QueueCapacityError(Exception):
     pass
 
 
+def parse_timesteps(value):
+    try:
+        timesteps = tuple(int(item.strip()) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "timesteps must be comma-separated integers"
+        ) from exc
+    if not 1 <= len(timesteps) <= 16:
+        raise argparse.ArgumentTypeError("provide between 1 and 16 timesteps")
+    if any(index < 0 or index >= 1000 for index in timesteps):
+        raise argparse.ArgumentTypeError("timestep indices must be between 0 and 999")
+    if any(left >= right for left, right in zip(timesteps, timesteps[1:])):
+        raise argparse.ArgumentTypeError("timestep indices must be strictly increasing")
+    return timesteps
+
+
+def default_prompt(args):
+    if args.default_prompt is not None:
+        return args.default_prompt.strip()
+    prompt_path = Path(args.action_path) / "prompt.txt"
+    if prompt_path.is_file():
+        return prompt_path.read_text(encoding="utf-8").strip()
+    return DEFAULT_PROMPT
+
+
+def default_image_path(args):
+    if args.default_image is not None:
+        return Path(args.default_image)
+    input_dir = Path(args.action_path)
+    for suffix in (".jpg", ".jpeg", ".png", ".webp"):
+        path = input_dir / f"image{suffix}"
+        if path.is_file():
+            return path
+    return input_dir / "image.jpg"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Persistent 8-GPU HTTP inference service for LingBot World V2."
     )
+    parser.add_argument("--task", choices=SUPPORTED_TASKS, default="i2v-A14B")
     parser.add_argument("--ckpt-dir", default="lingbot-world-v2-14b-causal-fast")
-    parser.add_argument("--action-path", default="examples/03")
+    parser.add_argument(
+        "--action-path",
+        default="examples/03",
+        help="Default input directory containing image and trajectory/action arrays.",
+    )
+    parser.add_argument("--default-image", default=None)
+    parser.add_argument("--default-prompt", default=None)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--data-dir", default="/mnt/data/lingbot-world-v2")
@@ -60,7 +114,19 @@ def parse_args():
     parser.add_argument("--local-attn-size", type=int, default=18)
     parser.add_argument("--sink-size", type=int, default=6)
     parser.add_argument("--ulysses-size", type=int, default=8)
+    parser.add_argument(
+        "--dit-fsdp", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--t5-fsdp", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--sample-shift", type=float, default=10.0)
+    parser.add_argument(
+        "--timesteps-index",
+        type=parse_timesteps,
+        default=DEFAULT_TIMESTEPS_INDEX,
+        metavar="I0,I1,...",
+    )
     parser.add_argument("--max-attention-size", type=int, default=None)
     parser.add_argument(
         "--max-upload-mb",
@@ -88,6 +154,12 @@ def parse_args():
         parser.error("--retention-hours cannot be negative")
     if args.max_upload_mb < 1:
         parser.error("--max-upload-mb must be positive")
+    if args.max_attention_size is not None and args.max_attention_size < 1:
+        parser.error("--max-attention-size must be positive")
+    if not math.isfinite(args.sample_shift) or args.sample_shift <= 0:
+        parser.error("--sample-shift must be a positive finite number")
+    if not default_prompt(args):
+        parser.error("the default prompt must not be empty")
     return args
 
 
@@ -103,6 +175,10 @@ class ServiceState:
         self.output_dir = Path(args.output_dir)
         self.jobs_dir = self.data_dir / "jobs"
         self.db_path = self.data_dir / "jobs.sqlite3"
+        self.default_prompt = default_prompt(args)
+        self.default_image_path = default_image_path(args)
+        self.default_image_bytes = self.default_image_path.read_bytes()
+        self.default_image_suffix = self.default_image_path.suffix.lower()
         self.db_lock = threading.RLock()
         self.pending = queue.Queue()
         self.active_job_id = None
@@ -123,11 +199,16 @@ class ServiceState:
                     queue_order INTEGER NOT NULL UNIQUE,
                     request_id TEXT NOT NULL UNIQUE,
                     status TEXT NOT NULL,
+                    task TEXT,
                     prompt TEXT NOT NULL,
+                    size TEXT,
                     frame_num INTEGER NOT NULL,
                     seed INTEGER NOT NULL,
+                    sample_shift REAL,
+                    timesteps_index TEXT,
                     image_path TEXT NOT NULL,
                     action_path TEXT,
+                    input_sources TEXT,
                     output_path TEXT NOT NULL,
                     job_dir TEXT NOT NULL,
                     error TEXT,
@@ -153,6 +234,18 @@ class ServiceState:
                     )
             if "action_path" not in columns:
                 self.db.execute("ALTER TABLE jobs ADD COLUMN action_path TEXT")
+            migrations = {
+                "task": "TEXT",
+                "size": "TEXT",
+                "sample_shift": "REAL",
+                "timesteps_index": "TEXT",
+                "input_sources": "TEXT",
+            }
+            for column, column_type in migrations.items():
+                if column not in columns:
+                    self.db.execute(
+                        f"ALTER TABLE jobs ADD COLUMN {column} {column_type}"
+                    )
             self.db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS jobs_queue_order_idx "
                 "ON jobs(queue_order)"
@@ -236,15 +329,45 @@ class ServiceState:
         return result["position"]
 
     def _public_record(self, row):
+        input_sources = (
+            json.loads(row["input_sources"])
+            if row["input_sources"]
+            else {
+                "prompt": "client",
+                "image": "client",
+                "poses.npy": "client" if row["action_path"] else "default",
+                "intrinsics.npy": "client" if row["action_path"] else "default",
+            }
+        )
+        array_sources = [
+            source
+            for filename, _, _, _ in ARRAY_INPUTS
+            if (source := input_sources.get(filename)) not in (None, "unavailable")
+        ]
+        if not any(source == "client" for source in array_sources):
+            trajectory_source = "default"
+        elif all(source == "client" for source in array_sources):
+            trajectory_source = "uploaded"
+        else:
+            trajectory_source = "mixed"
         return {
             "id": row["id"],
             "request_id": row["request_id"],
             "status": row["status"],
             "queue_position": self._queue_position(row),
+            "task": row["task"] or self.args.task,
             "prompt": row["prompt"],
+            "size": row["size"] or self.args.size,
             "frame_num": row["frame_num"],
             "seed": row["seed"],
-            "trajectory_source": "uploaded" if row["action_path"] else "default",
+            "sample_shift": row["sample_shift"]
+            if row["sample_shift"] is not None
+            else self.args.sample_shift,
+            "timesteps_index": json.loads(row["timesteps_index"])
+            if row["timesteps_index"]
+            else list(self.args.timesteps_index),
+            "input_sources": input_sources,
+            "trajectory_source": trajectory_source,
             "attempts": row["attempts"],
             "created_at": row["created_at"],
             "started_at": row["started_at"],
@@ -258,12 +381,17 @@ class ServiceState:
 
     def create_job(
         self,
+        task,
         prompt,
         image_bytes,
         image_suffix,
-        trajectory_files,
+        input_files,
+        input_sources,
+        size,
         frame_num,
         seed,
+        sample_shift,
+        timesteps_index,
         request_id,
     ):
         if not REQUEST_ID_PATTERN.fullmatch(request_id):
@@ -296,25 +424,26 @@ class ServiceState:
             image_path = job_dir / f"input{image_suffix}"
             output_path = self.output_dir / date_path / f"{job_id}.mp4"
             request_path = job_dir / "request.json"
-            action_path = job_dir / "trajectory" if trajectory_files else None
+            action_path = job_dir / "inputs"
             job_dir.mkdir(parents=True, exist_ok=False)
             try:
                 image_path.write_bytes(image_bytes)
-                if action_path is not None:
-                    action_path.mkdir()
-                    for filename, content in trajectory_files.items():
-                        (action_path / filename).write_bytes(content)
+                action_path.mkdir()
+                for filename, content in input_files.items():
+                    (action_path / filename).write_bytes(content)
                 request_path.write_text(
                     json.dumps(
                         {
                             "id": job_id,
                             "request_id": request_id,
+                            "task": task,
                             "prompt": prompt,
+                            "size": size,
                             "frame_num": frame_num,
                             "seed": seed,
-                            "trajectory_source": "uploaded"
-                            if action_path is not None
-                            else "default",
+                            "sample_shift": sample_shift,
+                            "timesteps_index": timesteps_index,
+                            "input_sources": input_sources,
                             "created_at": created_at,
                         },
                         ensure_ascii=False,
@@ -326,23 +455,34 @@ class ServiceState:
                 self.db.execute(
                     """
                     INSERT INTO jobs (
-                        id, queue_order, request_id, status, prompt, frame_num, seed,
-                        image_path, action_path, output_path, job_dir, created_at
-                    ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
+                        id, queue_order, request_id, status, task, prompt, size,
+                        frame_num, seed, sample_shift, timesteps_index, image_path,
+                        action_path, input_sources, output_path, job_dir, created_at
+                    ) VALUES (
+                        :id, :queue_order, :request_id, 'queued', :task, :prompt,
+                        :size, :frame_num, :seed, :sample_shift, :timesteps_index,
+                        :image_path, :action_path, :input_sources, :output_path,
+                        :job_dir, :created_at
+                    )
                     """,
-                    (
-                        job_id,
-                        queue_order,
-                        request_id,
-                        prompt,
-                        frame_num,
-                        seed,
-                        str(image_path),
-                        str(action_path) if action_path is not None else None,
-                        str(output_path),
-                        str(job_dir),
-                        created_at,
-                    ),
+                    {
+                        "id": job_id,
+                        "queue_order": queue_order,
+                        "request_id": request_id,
+                        "task": task,
+                        "prompt": prompt,
+                        "size": size,
+                        "frame_num": frame_num,
+                        "seed": seed,
+                        "sample_shift": sample_shift,
+                        "timesteps_index": json.dumps(timesteps_index),
+                        "image_path": str(image_path),
+                        "action_path": str(action_path),
+                        "input_sources": json.dumps(input_sources),
+                        "output_path": str(output_path),
+                        "job_dir": str(job_dir),
+                        "created_at": created_at,
+                    },
                 )
                 self.db.commit()
             except Exception:
@@ -381,11 +521,19 @@ class ServiceState:
             return {
                 "type": "generate",
                 "job_id": row["id"],
+                "task": row["task"] or self.args.task,
                 "prompt": row["prompt"],
                 "image_path": row["image_path"],
                 "action_path": row["action_path"] or self.args.action_path,
+                "size": row["size"] or self.args.size,
                 "frame_num": row["frame_num"],
                 "seed": row["seed"],
+                "sample_shift": row["sample_shift"]
+                if row["sample_shift"] is not None
+                else self.args.sample_shift,
+                "timesteps_index": json.loads(row["timesteps_index"])
+                if row["timesteps_index"]
+                else list(self.args.timesteps_index),
                 "output_path": row["output_path"],
             }
 
@@ -438,6 +586,43 @@ class ServiceState:
                 "succeeded": counts.get("succeeded", 0),
                 "failed": counts.get("failed", 0),
             }
+
+    def capabilities(self):
+        default_inputs = {
+            "prompt": True,
+            "image": self.default_image_path.is_file(),
+        }
+        for filename, _, _, required in ARRAY_INPUTS:
+            default_inputs[filename] = {
+                "available": (Path(self.args.action_path) / filename).is_file(),
+                "required": required,
+            }
+        return {
+            "task": self.args.task,
+            "request_parameters": {
+                "sizes": list(SUPPORTED_SIZES),
+                "default_size": self.args.size,
+                "default_frame_num": self.args.frame_num,
+                "max_frame_num": self.args.max_frame_num,
+                "default_seed": 42,
+                "default_sample_shift": self.args.sample_shift,
+                "default_timesteps_index": list(self.args.timesteps_index),
+            },
+            "default_inputs": default_inputs,
+            "server_parameters": {
+                "checkpoint": Path(self.args.ckpt_dir).name,
+                "infer_mode": "causal_fast",
+                "dit_fsdp": self.args.dit_fsdp,
+                "t5_fsdp": self.args.t5_fsdp,
+                "ulysses_size": self.args.ulysses_size,
+                "chunk_size": self.args.chunk_size,
+                "local_attn_size": self.args.local_attn_size,
+                "sink_size": self.args.sink_size,
+                "offload_model": False,
+                "max_attention_size": self.args.max_attention_size,
+            },
+            "max_upload_mb": self.args.max_upload_mb,
+        }
 
     def video_path(self, job_id):
         with self.db_lock:
@@ -498,6 +683,10 @@ class ApiHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/v1/capabilities":
+            self.send_json(HTTPStatus.OK, self.service.capabilities())
+            return
+
         if path == "/v1/jobs":
             try:
                 limit = int(parse_qs(parsed.query).get("limit", ["50"])[0])
@@ -535,11 +724,30 @@ class ApiHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self.read_json()
+            task = payload.get("task") or self.service.args.task
+            if not isinstance(task, str):
+                raise ValueError("task must be a string")
+            if task != self.service.args.task:
+                raise ValueError(
+                    f"task {task!r} is not loaded; server task is "
+                    f"{self.service.args.task!r}"
+                )
+
             prompt = payload.get("prompt")
+            prompt_source = "client"
+            if prompt is None:
+                prompt = self.service.default_prompt
+                prompt_source = "default"
             if not isinstance(prompt, str) or not prompt.strip():
                 raise ValueError("prompt must be a non-empty string")
             if len(prompt) > 20_000:
                 raise ValueError("prompt is too long")
+
+            size = payload.get("size") or self.service.args.size
+            if size not in SUPPORTED_SIZES:
+                raise ValueError(
+                    f"size must be one of: {', '.join(SUPPORTED_SIZES)}"
+                )
 
             frame_num = payload.get("frame_num", self.service.args.frame_num)
             if isinstance(frame_num, bool) or not isinstance(frame_num, int):
@@ -553,18 +761,45 @@ class ApiHandler(BaseHTTPRequestHandler):
             if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
                 raise ValueError("seed must be a non-negative integer")
 
+            sample_shift = payload.get(
+                "sample_shift", self.service.args.sample_shift
+            )
+            if (
+                isinstance(sample_shift, bool)
+                or not isinstance(sample_shift, (int, float))
+                or not math.isfinite(sample_shift)
+                or sample_shift <= 0
+            ):
+                raise ValueError("sample_shift must be a positive finite number")
+            sample_shift = float(sample_shift)
+
+            timesteps_index = payload.get(
+                "timesteps_index", list(self.service.args.timesteps_index)
+            )
+            self.validate_timesteps(timesteps_index)
+
             request_id = payload.get("request_id") or uuid.uuid4().hex
             if not isinstance(request_id, str):
                 raise ValueError("request_id must be a string")
-            image_bytes, image_suffix = self.decode_image(payload)
-            trajectory_files = self.decode_trajectory(payload)
+            image_bytes, image_suffix, image_source = self.decode_image(payload)
+            input_files, array_sources = self.decode_trajectory(payload)
+            input_sources = {
+                "prompt": prompt_source,
+                "image": image_source,
+                **array_sources,
+            }
             job, created = self.service.create_job(
+                task,
                 prompt.strip(),
                 image_bytes,
                 image_suffix,
-                trajectory_files,
+                input_files,
+                input_sources,
+                size,
                 frame_num,
                 seed,
+                sample_shift,
+                timesteps_index,
                 request_id,
             )
             self.send_json(HTTPStatus.ACCEPTED if created else HTTPStatus.OK, job)
@@ -588,8 +823,8 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise ValueError("invalid Content-Length") from exc
 
         max_file_bytes = self.service.args.max_upload_mb * 1024 * 1024
-        # One image and two trajectory arrays, all base64 encoded.
-        max_body_bytes = max_file_bytes * 4 + 1024 * 1024
+        # One image and five arrays, all base64 encoded.
+        max_body_bytes = max_file_bytes * 8 + 1024 * 1024
         if content_length < 1 or content_length > max_body_bytes:
             raise ValueError("request body is too large")
         try:
@@ -602,8 +837,16 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def decode_image(self, payload):
         encoded = payload.get("image_base64")
+        if encoded is None:
+            if "image_name" in payload:
+                raise ValueError("image_base64 is required when image_name is provided")
+            return (
+                self.service.default_image_bytes,
+                self.service.default_image_suffix,
+                "default",
+            )
         if not isinstance(encoded, str) or not encoded:
-            raise ValueError("image_base64 is required")
+            raise ValueError("image_base64 must be a non-empty string")
         image_bytes = base64.b64decode(encoded, validate=True)
         max_bytes = self.service.args.max_upload_mb * 1024 * 1024
         if len(image_bytes) > max_bytes:
@@ -619,49 +862,56 @@ class ApiHandler(BaseHTTPRequestHandler):
             image.verify()
         if width < 1 or height < 1 or width * height > 50_000_000:
             raise ValueError("image dimensions are not supported")
-        return image_bytes, suffix
+        return image_bytes, suffix, "client"
 
     def decode_trajectory(self, payload):
         trajectory = payload.get("trajectory")
         if trajectory is None:
-            return None
+            trajectory = {}
         if not isinstance(trajectory, dict):
             raise ValueError("trajectory must be a JSON object")
 
         max_bytes = self.service.args.max_upload_mb * 1024 * 1024
         files = {}
         arrays = {}
-        for filename, field in (
-            ("poses.npy", "poses_base64"),
-            ("intrinsics.npy", "intrinsics_base64"),
-        ):
+        sources = {}
+        default_input_dir = Path(self.service.args.action_path)
+        for filename, field, expected_tail, required in ARRAY_INPUTS:
             encoded = trajectory.get(field)
-            if not isinstance(encoded, str) or not encoded:
-                raise ValueError(f"trajectory.{field} is required")
-            content = base64.b64decode(encoded, validate=True)
+            if encoded is None:
+                default_path = default_input_dir / filename
+                if not default_path.is_file():
+                    if required:
+                        raise ValueError(f"default input file is missing: {filename}")
+                    sources[filename] = "unavailable"
+                    continue
+                content = default_path.read_bytes()
+                sources[filename] = "default"
+            else:
+                if not isinstance(encoded, str) or not encoded:
+                    raise ValueError(f"trajectory.{field} must be non-empty")
+                content = base64.b64decode(encoded, validate=True)
+                sources[filename] = "client"
             if len(content) > max_bytes:
-                raise ValueError(f"uploaded trajectory file is too large: {filename}")
+                raise ValueError(f"input array is too large: {filename}")
             try:
                 array = np.load(io.BytesIO(content), allow_pickle=False)
             except (EOFError, OSError, ValueError) as exc:
-                raise ValueError(f"invalid trajectory file: {filename}") from exc
+                raise ValueError(f"invalid input array: {filename}") from exc
             if not isinstance(array, np.ndarray):
                 if hasattr(array, "close"):
                     array.close()
-                raise ValueError(f"trajectory file must contain one array: {filename}")
+                raise ValueError(f"input file must contain one array: {filename}")
             if array.dtype.kind not in "fiu" or not np.isfinite(array).all():
-                raise ValueError(
-                    f"trajectory array must contain finite numbers: {filename}"
-                )
+                raise ValueError(f"input array must contain finite numbers: {filename}")
+            if array.ndim != len(expected_tail) + 1 or array.shape[1:] != expected_tail:
+                shape = ", ".join(("frames", *(str(item) for item in expected_tail)))
+                raise ValueError(f"{filename} must have shape ({shape})")
             files[filename] = content
             arrays[filename] = array
 
         poses = arrays["poses.npy"]
         intrinsics = arrays["intrinsics.npy"]
-        if poses.ndim != 3 or poses.shape[1:] != (4, 4):
-            raise ValueError("trajectory poses.npy must have shape (frames, 4, 4)")
-        if intrinsics.ndim != 2 or intrinsics.shape[1:] != (4,):
-            raise ValueError("trajectory intrinsics.npy must have shape (frames, 4)")
         if poses.shape[0] != intrinsics.shape[0]:
             raise ValueError("trajectory arrays must have the same frame count")
         minimum_frames = 4 * (self.service.args.chunk_size - 1) + 1
@@ -669,7 +919,20 @@ class ApiHandler(BaseHTTPRequestHandler):
             raise ValueError(
                 f"trajectory must contain at least {minimum_frames} frames"
             )
-        return files
+        return files, sources
+
+    def validate_timesteps(self, timesteps):
+        if not isinstance(timesteps, list) or not 1 <= len(timesteps) <= 16:
+            raise ValueError("timesteps_index must be a list of 1 to 16 integers")
+        if any(
+            isinstance(item, bool) or not isinstance(item, int)
+            for item in timesteps
+        ):
+            raise ValueError("timesteps_index must contain only integers")
+        if any(item < 0 or item >= 1000 for item in timesteps):
+            raise ValueError("timesteps_index values must be between 0 and 999")
+        if any(left >= right for left, right in zip(timesteps, timesteps[1:])):
+            raise ValueError("timesteps_index must be strictly increasing")
 
     def send_video(self, job_id):
         path = self.service.video_path(job_id)
@@ -733,6 +996,16 @@ def validate_server_paths(args):
         path = action_path / filename
         if not path.is_file():
             raise FileNotFoundError(f"camera file not found: {path}")
+    image_path = default_image_path(args)
+    if not image_path.is_file():
+        raise FileNotFoundError(f"default image not found: {image_path}")
+    if image_path.suffix.lower() not in IMAGE_SUFFIXES:
+        raise ValueError(f"unsupported default image type: {image_path.suffix}")
+    with Image.open(image_path) as image:
+        width, height = image.size
+        image.verify()
+    if width < 1 or height < 1 or width * height > 50_000_000:
+        raise ValueError("default image dimensions are not supported")
     data_dir = Path(args.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "jobs").mkdir(parents=True, exist_ok=True)
@@ -744,7 +1017,7 @@ def create_pipeline(args, rank, local_rank, world_size):
     from wan.configs import WAN_CONFIGS
     from wan.distributed.util import init_distributed_group
 
-    config = WAN_CONFIGS["i2v-A14B"]
+    config = WAN_CONFIGS[args.task]
     if world_size != args.ulysses_size:
         raise ValueError(
             f"WORLD_SIZE ({world_size}) must equal --ulysses-size ({args.ulysses_size})"
@@ -759,8 +1032,8 @@ def create_pipeline(args, rank, local_rank, world_size):
         checkpoint_dir=args.ckpt_dir,
         device_id=local_rank,
         rank=rank,
-        t5_fsdp=True,
-        dit_fsdp=True,
+        t5_fsdp=args.t5_fsdp,
+        dit_fsdp=args.dit_fsdp,
         use_sp=True,
         t5_cpu=False,
         local_attn_size=args.local_attn_size,
@@ -777,14 +1050,19 @@ def run_generation(pipeline, config, args, command, rank):
     image = Image.open(command["image_path"]).convert("RGB")
     video = None
     try:
+        if command["task"] != args.task:
+            raise ValueError(
+                f"job task {command['task']!r} does not match loaded task {args.task!r}"
+            )
         video = pipeline.generate(
             command["prompt"],
             image,
             action_path=command["action_path"],
             chunk_size=args.chunk_size,
-            max_area=MAX_AREA_CONFIGS[args.size],
+            max_area=MAX_AREA_CONFIGS[command["size"]],
             frame_num=command["frame_num"],
-            shift=args.sample_shift,
+            timesteps_index=command["timesteps_index"],
+            shift=command["sample_shift"],
             seed=command["seed"],
             offload_model=False,
             max_attention_size=args.max_attention_size,
