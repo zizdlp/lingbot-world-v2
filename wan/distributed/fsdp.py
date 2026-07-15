@@ -1,4 +1,5 @@
 import gc
+import os
 from functools import partial
 
 import torch
@@ -8,6 +9,23 @@ from torch.distributed.fsdp.wrap import lambda_auto_wrap_policy
 from torch.distributed.utils import _free_storage
 
 
+_SHARDING_STRATEGIES = {
+    "FULL_SHARD": ShardingStrategy.FULL_SHARD,
+    "SHARD_GRAD_OP": ShardingStrategy.SHARD_GRAD_OP,
+}
+
+
+def get_sharding_strategy():
+    name = os.getenv("FSDP_SHARDING_STRATEGY", "SHARD_GRAD_OP").strip().upper()
+    try:
+        return _SHARDING_STRATEGIES[name]
+    except KeyError as exc:
+        supported = ", ".join(_SHARDING_STRATEGIES)
+        raise ValueError(
+            f"Unsupported FSDP_SHARDING_STRATEGY={name!r}; expected one of: {supported}"
+        ) from exc
+
+
 def shard_model(
     model,
     device_id,
@@ -15,10 +33,12 @@ def shard_model(
     reduce_dtype=torch.float32,
     buffer_dtype=torch.float32,
     process_group=None,
-    sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,
+    sharding_strategy=None,
     sync_module_states=True,
     use_lora=False
 ):
+    if sharding_strategy is None:
+        sharding_strategy = get_sharding_strategy()
     model = FSDP(
         module=model,
         process_group=process_group,
