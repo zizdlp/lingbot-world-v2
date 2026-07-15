@@ -120,7 +120,16 @@ bash run_fast.sh <weights_dir> <frame_num>
 ```
 
 ### Deployment
-We do NOT plan to release our deployment code. If you would like to deploy our model yourself, please refer to the LingBot-World deployment in [SGLang](https://docs.sglang.io/cookbook/diffusion/LingBot-World/LingBot-World-2.0) or [flashdreams](https://github.com/NVIDIA/flashdreams).
+
+This repository includes a persistent multi-GPU HTTP inference service in
+`server.py` and a matching command-line client in `client.py`. See the
+[HTTP inference service guide](docs/http-inference-service.zh-CN.md) for server
+startup, parameter ownership, input formats, API endpoints, persistence, and
+client examples.
+
+For other deployment stacks, refer to the LingBot-World integrations in
+[SGLang](https://docs.sglang.io/cookbook/diffusion/LingBot-World/LingBot-World-2.0)
+or [flashdreams](https://github.com/NVIDIA/flashdreams).
 
 ## 📚 Related Projects
 - [LingBot-World](https://github.com/robbyant/lingbot-world)

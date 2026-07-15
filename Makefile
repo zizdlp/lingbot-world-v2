@@ -1,4 +1,4 @@
-.PHONY: format start_server start_client health list job download
+.PHONY: format start_server start_client capabilities health list job download
 
 SERVER_URL ?= http://127.0.0.1:8000
 LIMIT ?= 20
@@ -14,9 +14,21 @@ start_server:
 	FSDP_SHARDING_STRATEGY=FULL_SHARD \
 	NCCL_DEBUG=WARN \
 	torchrun --nproc_per_node=8 server.py \
+		--task i2v-A14B \
 		--ckpt-dir lingbot-world-v2-14b-causal-fast \
 		--action-path examples/03 \
-		--data-dir /mnt/workspace/lingbot-world-service \
+		--size '480*832' \
+		--frame-num 361 \
+		--max-frame-num 361 \
+		--chunk-size 4 \
+		--local-attn-size 18 \
+		--sink-size 6 \
+		--ulysses-size 8 \
+		--dit-fsdp \
+		--t5-fsdp \
+		--sample-shift 10.0 \
+		--timesteps-index '0,250,500,750' \
+		--data-dir /mnt/data/lingbot-world-service \
 		--output-dir /mnt/outputs/lingbot-world-v2 \
 		--host 0.0.0.0 \
 		--port 8000 \
@@ -26,11 +38,19 @@ start_server:
 start_client:
 	python client.py \
 		--server $(SERVER_URL) \
-		--image examples/03/image.jpg \
+		--task i2v-A14B \
+		--input-dir examples/05 \
+		--size '480*832' \
 		--frame-num 361 \
 		--seed 42 \
-		--output-dir /mnt/outputs/lingbot-world-v2/downloads \
-		--prompt "A serene lakeside scene with a lone tree standing in calm water."
+		--sample-shift 10.0 \
+		--timesteps-index '0,250,500,750' \
+		--output-dir /mnt/outputs/lingbot-world-v2/downloads
+
+capabilities:
+	@python client.py \
+		--server $(SERVER_URL) \
+		--show-capabilities
 
 health:
 	@curl --fail --silent --show-error --write-out '\n' \

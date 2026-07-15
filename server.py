@@ -99,7 +99,7 @@ def parse_args():
     parser.add_argument("--default-prompt", default=None)
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--data-dir", default="/mnt/data/lingbot-world-v2")
+    parser.add_argument("--data-dir", default="/mnt/data/lingbot-world-service")
     parser.add_argument(
         "--output-dir",
         default="/mnt/outputs/lingbot-world-v2",
