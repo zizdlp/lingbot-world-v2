@@ -15,7 +15,7 @@ start_server:
 	NCCL_DEBUG=WARN \
 	torchrun --nproc_per_node=8 server.py \
 		--task i2v-A14B \
-		--ckpt-dir lingbot-world-v2-14b-causal-fast \
+		--ckpt-dir /mnt/models/lingbot-world-v2-14b-causal-fast \
 		--action-path examples/03 \
 		--size '480*832' \
 		--frame-num 361 \
