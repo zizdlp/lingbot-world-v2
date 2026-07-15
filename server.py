@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from PIL import Image, UnidentifiedImageError
@@ -44,7 +45,7 @@ def parse_args():
     parser.add_argument("--action-path", default="examples/03")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--data-dir", default="/mnt/workspace/lingbot-world-service")
+    parser.add_argument("--data-dir", default="/mnt/data/lingbot-world-v2")
     parser.add_argument(
         "--output-dir",
         default="/mnt/outputs/lingbot-world-v2",
@@ -61,7 +62,12 @@ def parse_args():
     parser.add_argument("--ulysses-size", type=int, default=8)
     parser.add_argument("--sample-shift", type=float, default=10.0)
     parser.add_argument("--max-attention-size", type=int, default=None)
-    parser.add_argument("--max-upload-mb", type=int, default=32)
+    parser.add_argument(
+        "--max-upload-mb",
+        type=int,
+        default=32,
+        help="Maximum size of each uploaded image or trajectory file.",
+    )
     args = parser.parse_args()
 
     if args.frame_num < 1 or args.max_frame_num < 1:
@@ -80,6 +86,8 @@ def parse_args():
         parser.error("--max-queue-size must be positive")
     if args.retention_hours < 0:
         parser.error("--retention-hours cannot be negative")
+    if args.max_upload_mb < 1:
+        parser.error("--max-upload-mb must be positive")
     return args
 
 
@@ -119,6 +127,7 @@ class ServiceState:
                     frame_num INTEGER NOT NULL,
                     seed INTEGER NOT NULL,
                     image_path TEXT NOT NULL,
+                    action_path TEXT,
                     output_path TEXT NOT NULL,
                     job_dir TEXT NOT NULL,
                     error TEXT,
@@ -142,6 +151,8 @@ class ServiceState:
                         "UPDATE jobs SET queue_order = ? WHERE id = ?",
                         (queue_order, row["id"]),
                     )
+            if "action_path" not in columns:
+                self.db.execute("ALTER TABLE jobs ADD COLUMN action_path TEXT")
             self.db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS jobs_queue_order_idx "
                 "ON jobs(queue_order)"
@@ -152,6 +163,16 @@ class ServiceState:
             )
             self.db.commit()
 
+    def _missing_input(self, row):
+        if not Path(row["image_path"]).is_file():
+            return "input image is missing"
+        if row["action_path"]:
+            action_path = Path(row["action_path"])
+            for filename in ("poses.npy", "intrinsics.npy"):
+                if not (action_path / filename).is_file():
+                    return f"uploaded trajectory file is missing: {filename}"
+        return None
+
     def _recover_jobs(self):
         now = utc_timestamp()
         with self.db_lock:
@@ -160,14 +181,14 @@ class ServiceState:
             ).fetchall()
             for row in running_jobs:
                 output_path = Path(row["output_path"])
-                image_path = Path(row["image_path"])
+                missing_input = self._missing_input(row)
                 if output_path.is_file() and output_path.stat().st_size > 0:
                     self.db.execute(
                         "UPDATE jobs SET status = 'succeeded', finished_at = ?, error = NULL "
                         "WHERE id = ?",
                         (now, row["id"]),
                     )
-                elif image_path.is_file():
+                elif missing_input is None:
                     self.db.execute(
                         "UPDATE jobs SET status = 'queued', started_at = NULL, "
                         "error = 'recovered after server restart' WHERE id = ?",
@@ -176,22 +197,27 @@ class ServiceState:
                 else:
                     self.db.execute(
                         "UPDATE jobs SET status = 'failed', finished_at = ?, "
-                        "error = 'input image missing during restart recovery' WHERE id = ?",
-                        (now, row["id"]),
+                        "error = ? WHERE id = ?",
+                        (
+                            now,
+                            f"{missing_input} during restart recovery",
+                            row["id"],
+                        ),
                     )
 
             queued_jobs = self.db.execute(
-                "SELECT id, image_path FROM jobs WHERE status = 'queued' "
+                "SELECT * FROM jobs WHERE status = 'queued' "
                 "ORDER BY queue_order"
             ).fetchall()
             for row in queued_jobs:
-                if Path(row["image_path"]).is_file():
+                missing_input = self._missing_input(row)
+                if missing_input is None:
                     self.pending.put(row["id"])
                 else:
                     self.db.execute(
                         "UPDATE jobs SET status = 'failed', finished_at = ?, "
-                        "error = 'queued input image is missing' WHERE id = ?",
-                        (now, row["id"]),
+                        "error = ? WHERE id = ?",
+                        (now, f"queued {missing_input}", row["id"]),
                     )
             self.db.commit()
 
@@ -218,6 +244,7 @@ class ServiceState:
             "prompt": row["prompt"],
             "frame_num": row["frame_num"],
             "seed": row["seed"],
+            "trajectory_source": "uploaded" if row["action_path"] else "default",
             "attempts": row["attempts"],
             "created_at": row["created_at"],
             "started_at": row["started_at"],
@@ -230,7 +257,14 @@ class ServiceState:
         }
 
     def create_job(
-        self, prompt, image_bytes, image_suffix, frame_num, seed, request_id
+        self,
+        prompt,
+        image_bytes,
+        image_suffix,
+        trajectory_files,
+        frame_num,
+        seed,
+        request_id,
     ):
         if not REQUEST_ID_PATTERN.fullmatch(request_id):
             raise ValueError(
@@ -262,9 +296,14 @@ class ServiceState:
             image_path = job_dir / f"input{image_suffix}"
             output_path = self.output_dir / date_path / f"{job_id}.mp4"
             request_path = job_dir / "request.json"
+            action_path = job_dir / "trajectory" if trajectory_files else None
             job_dir.mkdir(parents=True, exist_ok=False)
             try:
                 image_path.write_bytes(image_bytes)
+                if action_path is not None:
+                    action_path.mkdir()
+                    for filename, content in trajectory_files.items():
+                        (action_path / filename).write_bytes(content)
                 request_path.write_text(
                     json.dumps(
                         {
@@ -273,6 +312,9 @@ class ServiceState:
                             "prompt": prompt,
                             "frame_num": frame_num,
                             "seed": seed,
+                            "trajectory_source": "uploaded"
+                            if action_path is not None
+                            else "default",
                             "created_at": created_at,
                         },
                         ensure_ascii=False,
@@ -285,8 +327,8 @@ class ServiceState:
                     """
                     INSERT INTO jobs (
                         id, queue_order, request_id, status, prompt, frame_num, seed,
-                        image_path, output_path, job_dir, created_at
-                    ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)
+                        image_path, action_path, output_path, job_dir, created_at
+                    ) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         job_id,
@@ -296,6 +338,7 @@ class ServiceState:
                         frame_num,
                         seed,
                         str(image_path),
+                        str(action_path) if action_path is not None else None,
                         str(output_path),
                         str(job_dir),
                         created_at,
@@ -340,6 +383,7 @@ class ServiceState:
                 "job_id": row["id"],
                 "prompt": row["prompt"],
                 "image_path": row["image_path"],
+                "action_path": row["action_path"] or self.args.action_path,
                 "frame_num": row["frame_num"],
                 "seed": row["seed"],
                 "output_path": row["output_path"],
@@ -513,10 +557,12 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not isinstance(request_id, str):
                 raise ValueError("request_id must be a string")
             image_bytes, image_suffix = self.decode_image(payload)
+            trajectory_files = self.decode_trajectory(payload)
             job, created = self.service.create_job(
                 prompt.strip(),
                 image_bytes,
                 image_suffix,
+                trajectory_files,
                 frame_num,
                 seed,
                 request_id,
@@ -541,8 +587,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             raise ValueError("invalid Content-Length") from exc
 
-        max_image_bytes = self.service.args.max_upload_mb * 1024 * 1024
-        max_body_bytes = max_image_bytes * 4 // 3 + 1024 * 1024
+        max_file_bytes = self.service.args.max_upload_mb * 1024 * 1024
+        # One image and two trajectory arrays, all base64 encoded.
+        max_body_bytes = max_file_bytes * 4 + 1024 * 1024
         if content_length < 1 or content_length > max_body_bytes:
             raise ValueError("request body is too large")
         try:
@@ -573,6 +620,56 @@ class ApiHandler(BaseHTTPRequestHandler):
         if width < 1 or height < 1 or width * height > 50_000_000:
             raise ValueError("image dimensions are not supported")
         return image_bytes, suffix
+
+    def decode_trajectory(self, payload):
+        trajectory = payload.get("trajectory")
+        if trajectory is None:
+            return None
+        if not isinstance(trajectory, dict):
+            raise ValueError("trajectory must be a JSON object")
+
+        max_bytes = self.service.args.max_upload_mb * 1024 * 1024
+        files = {}
+        arrays = {}
+        for filename, field in (
+            ("poses.npy", "poses_base64"),
+            ("intrinsics.npy", "intrinsics_base64"),
+        ):
+            encoded = trajectory.get(field)
+            if not isinstance(encoded, str) or not encoded:
+                raise ValueError(f"trajectory.{field} is required")
+            content = base64.b64decode(encoded, validate=True)
+            if len(content) > max_bytes:
+                raise ValueError(f"uploaded trajectory file is too large: {filename}")
+            try:
+                array = np.load(io.BytesIO(content), allow_pickle=False)
+            except (EOFError, OSError, ValueError) as exc:
+                raise ValueError(f"invalid trajectory file: {filename}") from exc
+            if not isinstance(array, np.ndarray):
+                if hasattr(array, "close"):
+                    array.close()
+                raise ValueError(f"trajectory file must contain one array: {filename}")
+            if array.dtype.kind not in "fiu" or not np.isfinite(array).all():
+                raise ValueError(
+                    f"trajectory array must contain finite numbers: {filename}"
+                )
+            files[filename] = content
+            arrays[filename] = array
+
+        poses = arrays["poses.npy"]
+        intrinsics = arrays["intrinsics.npy"]
+        if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+            raise ValueError("trajectory poses.npy must have shape (frames, 4, 4)")
+        if intrinsics.ndim != 2 or intrinsics.shape[1:] != (4,):
+            raise ValueError("trajectory intrinsics.npy must have shape (frames, 4)")
+        if poses.shape[0] != intrinsics.shape[0]:
+            raise ValueError("trajectory arrays must have the same frame count")
+        minimum_frames = 4 * (self.service.args.chunk_size - 1) + 1
+        if poses.shape[0] < minimum_frames:
+            raise ValueError(
+                f"trajectory must contain at least {minimum_frames} frames"
+            )
+        return files
 
     def send_video(self, job_id):
         path = self.service.video_path(job_id)
@@ -683,7 +780,7 @@ def run_generation(pipeline, config, args, command, rank):
         video = pipeline.generate(
             command["prompt"],
             image,
-            action_path=args.action_path,
+            action_path=command["action_path"],
             chunk_size=args.chunk_size,
             max_area=MAX_AREA_CONFIGS[args.size],
             frame_num=command["frame_num"],

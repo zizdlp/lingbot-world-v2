@@ -20,6 +20,15 @@ def parse_args():
     parser.add_argument("--server", default="http://127.0.0.1:8000")
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--image", default="examples/03/image.jpg")
+    parser.add_argument(
+        "--action-path",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Optional client-local trajectory directory containing poses.npy and "
+            "intrinsics.npy; the server default is used when omitted."
+        ),
+    )
     parser.add_argument("--frame-num", type=int, default=361)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -89,6 +98,18 @@ def submit_job(args):
         "image_name": image_path.name,
         "image_base64": base64.b64encode(image_path.read_bytes()).decode("ascii"),
     }
+    if args.action_path:
+        action_path = Path(args.action_path)
+        trajectory = {}
+        for filename, field in (
+            ("poses.npy", "poses_base64"),
+            ("intrinsics.npy", "intrinsics_base64"),
+        ):
+            path = action_path / filename
+            if not path.is_file():
+                raise FileNotFoundError(f"trajectory file not found: {path}")
+            trajectory[field] = base64.b64encode(path.read_bytes()).decode("ascii")
+        payload["trajectory"] = trajectory
     return json_request("POST", f"{args.server.rstrip('/')}/v1/jobs", payload)
 
 
@@ -146,7 +167,10 @@ def main():
     try:
         print(f"request_id={args.request_id}")
         job = submit_job(args)
-        print(f"submitted job {job['id']} (request_id={job['request_id']})")
+        print(
+            f"submitted job {job['id']} (request_id={job['request_id']}, "
+            f"trajectory={job.get('trajectory_source', 'default')})"
+        )
         if args.no_wait:
             print(urljoin(f"{args.server.rstrip('/')}/", f"v1/jobs/{job['id']}"))
             return
